@@ -1,0 +1,18 @@
+# Local/editor noise
+.DS_Store
+Thumbs.db
+__pycache__/
+*.py[cod]
+
+# Never commit live Codex state or backups.
+backups/
+sessions/
+archived_sessions/
+pets/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+auth.json
+.codex-global-state.json
+.codex-global-state.json.bak
+session_index.jsonl
