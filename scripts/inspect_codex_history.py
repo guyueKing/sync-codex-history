@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import glob
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -20,6 +21,20 @@ from typing import Any
 
 
 THREAD_ID_RE = re.compile(r"019[0-9a-f-]{32,}")
+
+SQLITE_BACKUP_FILES = ("state_5.sqlite", "goals_1.sqlite", "memories_1.sqlite", "logs_2.sqlite")
+HISTORY_BACKUP_FILES = ("session_index.jsonl",)
+HISTORY_BACKUP_DIRS = ("sessions", "archived_sessions")
+LOCAL_STATE_FILES = (
+    ".codex-global-state.json",
+    ".codex-global-state.json.bak",
+    "config.toml",
+    "AGENTS.md",
+    ".personality_migration",
+    "chrome-native-hosts-v2.json",
+)
+LOCAL_STATE_DIRS = ("pets", "skills", "plugins")
+CREDENTIAL_FILES_EXCLUDED = ("auth.json", "cap_sid")
 
 
 def default_codex_home() -> Path:
@@ -47,23 +62,155 @@ def copy_if_exists(src: Path, dst: Path) -> None:
             shutil.copy2(src, dst)
 
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def file_summary(path: Path) -> dict[str, Any]:
+    if not path.exists() or not path.is_file():
+        return {"exists": False}
+    stat = path.stat()
+    return {
+        "exists": True,
+        "bytes": stat.st_size,
+        "modified_at": dt.datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
+        "sha256": file_sha256(path),
+    }
+
+
+def directory_summary(path: Path) -> dict[str, Any]:
+    if not path.exists() or not path.is_dir():
+        return {"exists": False}
+
+    file_count = 0
+    total_bytes = 0
+    for child in path.rglob("*"):
+        if child.is_file():
+            file_count += 1
+            try:
+                total_bytes += child.stat().st_size
+            except OSError:
+                pass
+
+    child_names = sorted(child.name for child in path.iterdir())
+    stat = path.stat()
+    return {
+        "exists": True,
+        "direct_child_names": child_names[:200],
+        "direct_child_names_truncated": len(child_names) > 200,
+        "file_count": file_count,
+        "total_bytes": total_bytes,
+        "modified_at": dt.datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
+    }
+
+
+def local_state_manifest(base: Path) -> dict[str, Any]:
+    return {
+        "created_at": dt.datetime.now().isoformat(timespec="seconds"),
+        "base": str(base),
+        "settings_files": {name: file_summary(base / name) for name in LOCAL_STATE_FILES},
+        "directories": {name: directory_summary(base / name) for name in LOCAL_STATE_DIRS},
+        "credential_files_excluded": list(CREDENTIAL_FILES_EXCLUDED),
+    }
+
+
+def write_local_state_manifest(backup: Path) -> None:
+    manifest = local_state_manifest(backup)
+    (backup / "local_state_manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
 def make_backup(codex_home: Path) -> Path:
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     backup = codex_home / "backups" / f"sync-codex-history-{stamp}"
     backup.mkdir(parents=True, exist_ok=False)
 
-    for name in ("state_5.sqlite", "goals_1.sqlite", "memories_1.sqlite", "logs_2.sqlite"):
+    for name in SQLITE_BACKUP_FILES:
         src = codex_home / name
         if src.exists():
             sqlite_backup(src, backup / name)
 
-    for name in ("session_index.jsonl", ".codex-global-state.json", ".codex-global-state.json.bak"):
+    for name in HISTORY_BACKUP_FILES + LOCAL_STATE_FILES:
         copy_if_exists(codex_home / name, backup / name)
 
-    for name in ("sessions", "archived_sessions", "pets"):
+    for name in HISTORY_BACKUP_DIRS + LOCAL_STATE_DIRS:
         copy_if_exists(codex_home / name, backup / name)
 
+    write_local_state_manifest(backup)
     return backup
+
+
+def ensure_child_path(child: Path, parent: Path) -> None:
+    child_resolved = child.resolve()
+    parent_resolved = parent.resolve()
+    try:
+        is_child = child_resolved == parent_resolved or child_resolved.is_relative_to(parent_resolved)
+    except AttributeError:
+        is_child = str(child_resolved).startswith(str(parent_resolved) + os.sep)
+    if not is_child:
+        raise ValueError(f"Refusing to operate outside {parent_resolved}: {child_resolved}")
+
+
+def replace_path_from_backup(src: Path, dst: Path, codex_home: Path) -> None:
+    ensure_child_path(dst, codex_home)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists():
+        if dst.is_dir():
+            shutil.rmtree(dst)
+        else:
+            dst.unlink()
+    if src.is_dir():
+        shutil.copytree(src, dst)
+    else:
+        shutil.copy2(src, dst)
+
+
+def restore_local_state(codex_home: Path, backup: Path) -> dict[str, Any]:
+    codex_home = codex_home.expanduser().resolve()
+    backup = backup.expanduser().resolve()
+    if not codex_home.exists():
+        raise FileNotFoundError(f"Codex home not found: {codex_home}")
+    if not backup.exists() or not backup.is_dir():
+        raise FileNotFoundError(f"Backup directory not found: {backup}")
+
+    rollback = make_backup(codex_home)
+    restored: list[str] = []
+    missing_from_backup: list[str] = []
+
+    for name in LOCAL_STATE_FILES:
+        src = backup / name
+        if src.exists() and src.is_file():
+            ensure_child_path(src, backup)
+            replace_path_from_backup(src, codex_home / name, codex_home)
+            restored.append(name)
+        else:
+            missing_from_backup.append(name)
+
+    for name in LOCAL_STATE_DIRS:
+        src = backup / name
+        if src.exists() and src.is_dir():
+            ensure_child_path(src, backup)
+            replace_path_from_backup(src, codex_home / name, codex_home)
+            restored.append(name)
+        else:
+            missing_from_backup.append(name)
+
+    return {
+        "codex_home": str(codex_home),
+        "source_backup": str(backup),
+        "rollback_dir": str(rollback),
+        "restored": restored,
+        "missing_from_backup": missing_from_backup,
+        "credential_files_excluded": list(CREDENTIAL_FILES_EXCLUDED),
+        "restart_required": True,
+        "restart_hint": "Restart Codex or open a new thread so settings, skills, plugins, and pet state are reloaded.",
+    }
 
 
 def read_index_ids(codex_home: Path) -> set[str]:
@@ -166,11 +313,20 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--codex-home", default=str(default_codex_home()))
     parser.add_argument("--no-backup", action="store_true", help="Inspect only; do not create backup.")
+    parser.add_argument(
+        "--restore-local-state-from",
+        help="Restore settings, skills, plugins, and pets from a previous backup. Credentials are never restored.",
+    )
     args = parser.parse_args()
 
     codex_home = Path(args.codex_home).expanduser().resolve()
     if not codex_home.exists():
         raise SystemExit(f"Codex home not found: {codex_home}")
+
+    if args.restore_local_state_from:
+        restore_report = restore_local_state(codex_home, Path(args.restore_local_state_from))
+        print(json.dumps(restore_report, ensure_ascii=False, indent=2))
+        return 0
 
     backup = None if args.no_backup else make_backup(codex_home)
     threads = load_threads(codex_home)
@@ -195,6 +351,18 @@ def main() -> int:
         "session_file_ids": len(file_ids),
         "session_index_ids": len(index_ids),
         "model_provider_counts": providers,
+        "local_state": local_state_manifest(codex_home),
+        "local_state_restore": {
+            "supported": True,
+            "restores": list(LOCAL_STATE_FILES + LOCAL_STATE_DIRS),
+            "credential_files_excluded": list(CREDENTIAL_FILES_EXCLUDED),
+            "command": (
+                "python scripts/inspect_codex_history.py "
+                f"--codex-home {json.dumps(str(codex_home), ensure_ascii=False)} "
+                "--restore-local-state-from <backup-dir>"
+            ),
+            "restart_required_after_restore": True,
+        },
         "candidate_hidden_or_unindexed_user_threads": [
             {
                 "id": row["id"],

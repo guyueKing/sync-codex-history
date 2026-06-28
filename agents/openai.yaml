@@ -1,4 +1,4 @@
 interface:
   display_name: "Sync Codex History"
-  short_description: "Keep local Codex history visible after account switches."
-  default_prompt: "Use $sync-codex-history to restore local Codex history visibility after switching accounts or API login."
+  short_description: "Keep local Codex history, settings, skills, and pet state visible after account switches."
+  default_prompt: "Use $sync-codex-history to restore local Codex history, settings, skills, plugins, and pet state after switching accounts or API login."
